@@ -1,9 +1,9 @@
 package update
 
 import (
+	"fmt"
 	"testing"
 	"time"
-    "fmt"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/manager/orchestrator"
@@ -502,6 +502,98 @@ func TestUpdaterTaskTimeout(t *testing.T) {
 	}
 }
 
+func TestUpdaterOrder(t *testing.T) {
+	ctx := context.Background()
+	s := store.NewMemoryStore(nil)
+	assert.NotNil(t, s)
+
+	// Move tasks to their desired state.
+	watch, cancel := state.Watch(s.WatchQueue(), api.EventUpdateTask{})
+	defer cancel()
+	go func() {
+		for e := range watch {
+			task := e.(api.EventUpdateTask).Task
+			if task.Status.State == task.DesiredState {
+				continue
+			}
+			if task.DesiredState == api.TaskStateShutdown {
+				// dont progress, simulate that task takes time to shutdown
+				continue
+			}
+			err := s.Update(func(tx store.Tx) error {
+				task = store.GetTask(tx, task.ID)
+				task.Status.State = task.DesiredState
+				return store.UpdateTask(tx, task)
+			})
+			assert.NoError(t, err)
+		}
+	}()
+
+	instances := 3
+	service := &api.Service{
+		ID: "id1",
+		Spec: api.ServiceSpec{
+			Annotations: api.Annotations{
+				Name: "name1",
+			},
+			Task: api.TaskSpec{
+				Runtime: &api.TaskSpec_Container{
+					Container: &api.ContainerSpec{
+						Image:           "v:1",
+						StopGracePeriod: gogotypes.DurationProto(time.Hour),
+					},
+				},
+			},
+			Mode: &api.ServiceSpec_Replicated{
+				Replicated: &api.ReplicatedService{
+					Replicas: uint64(instances),
+				},
+			},
+		},
+	}
+
+	err := s.Update(func(tx store.Tx) error {
+		assert.NoError(t, store.CreateService(tx, service))
+		for i := 0; i < instances; i++ {
+			assert.NoError(t, store.CreateTask(tx, orchestrator.NewTask(nil, service, uint64(i), "")))
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+
+	originalTasks := getRunnableSlotSlice(t, s, service)
+	for _, instance := range originalTasks {
+		for _, task := range instance {
+			assert.Equal(t, "v:1", task.Spec.GetContainer().Image)
+			// progress task from New to Running
+			err := s.Update(func(tx store.Tx) error {
+				task = store.GetTask(tx, task.ID)
+				task.Status.State = task.DesiredState
+				return store.UpdateTask(tx, task)
+			})
+			assert.NoError(t, err)
+		}
+	}
+	service.Spec.Task.GetContainer().Image = "v:2"
+	service.Spec.Update = &api.UpdateConfig{
+		Parallelism: 1,
+		Order:       api.UpdateConfig_START_FIRST,
+		Delay:       10 * time.Millisecond,
+		Monitor:     gogotypes.DurationProto(50 * time.Millisecond),
+	}
+	updater := NewUpdater(s, restart.NewSupervisor(s), nil, service)
+	updater.Run(ctx, getRunnableSlotSlice(t, s, service))
+	allTasks := getRunningServiceTasks(t, s, service)
+	assert.Equal(t, instances*2, len(allTasks))
+	for _, task := range allTasks {
+		if task.Spec.GetContainer().Image == "v:1" {
+			assert.Equal(t, task.DesiredState, api.TaskStateShutdown)
+		} else if task.Spec.GetContainer().Image == "v:2" {
+			assert.Equal(t, task.DesiredState, api.TaskStateRunning)
+		}
+	}
+}
+
 func TestUseExistingTask(t *testing.T) {
 	ctx := context.Background()
 	s := store.NewMemoryStore(nil)
@@ -571,7 +663,7 @@ func TestUseExistingTask(t *testing.T) {
 				task.Status.State = task.DesiredState
 				return store.UpdateTask(tx, task)
 			})
-            assert.True(t, orchestrator.IsTaskDirty(service, task));
+			assert.True(t, orchestrator.IsTaskDirty(service, task))
 			assert.NoError(t, err)
 		}
 	}
@@ -589,8 +681,7 @@ func TestUseExistingTask(t *testing.T) {
 				return store.UpdateTask(tx, task)
 			})
 			assert.NoError(t, err)
-            fmt.Printf("%d\n", task.DesiredState);
+			fmt.Printf("%d\n", task.DesiredState)
 		}
 	}
 }
-
