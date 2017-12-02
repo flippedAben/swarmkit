@@ -3,6 +3,7 @@ package update
 import (
 	"testing"
 	"time"
+    "fmt"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/manager/orchestrator"
@@ -501,7 +502,7 @@ func TestUpdaterTaskTimeout(t *testing.T) {
 	}
 }
 
-func TestUpdaterOrder(t *testing.T) {
+func TestUseExistingTask(t *testing.T) {
 	ctx := context.Background()
 	s := store.NewMemoryStore(nil)
 	assert.NotNil(t, s)
@@ -570,25 +571,26 @@ func TestUpdaterOrder(t *testing.T) {
 				task.Status.State = task.DesiredState
 				return store.UpdateTask(tx, task)
 			})
+            assert.True(t, orchestrator.IsTaskDirty(service, task));
 			assert.NoError(t, err)
 		}
 	}
-	service.Spec.Task.GetContainer().Image = "v:2"
-	service.Spec.Update = &api.UpdateConfig{
-		Parallelism: 1,
-		Order:       api.UpdateConfig_START_FIRST,
-		Delay:       10 * time.Millisecond,
-		Monitor:     gogotypes.DurationProto(50 * time.Millisecond),
-	}
 	updater := NewUpdater(s, restart.NewSupervisor(s), nil, service)
 	updater.Run(ctx, getRunnableSlotSlice(t, s, service))
-	allTasks := getRunningServiceTasks(t, s, service)
-	assert.Equal(t, instances*2, len(allTasks))
-	for _, task := range allTasks {
-		if task.Spec.GetContainer().Image == "v:1" {
-			assert.Equal(t, task.DesiredState, api.TaskStateShutdown)
-		} else if task.Spec.GetContainer().Image == "v:2" {
-			assert.Equal(t, task.DesiredState, api.TaskStateRunning)
+
+	updatedTasks := getRunnableSlotSlice(t, s, service)
+	for _, instance := range updatedTasks {
+		for _, task := range instance {
+			assert.Equal(t, "v:1", task.Spec.GetContainer().Image)
+			// progress task from New to Running
+			err := s.Update(func(tx store.Tx) error {
+				task = store.GetTask(tx, task.ID)
+				task.Status.State = task.DesiredState
+				return store.UpdateTask(tx, task)
+			})
+			assert.NoError(t, err)
+            fmt.Printf("%d\n", task.DesiredState);
 		}
 	}
 }
+
